@@ -1,0 +1,65 @@
+################################################################################
+#                                                                              #
+# Note: when adding a new tool here, also adjust the Renovate configuration    #
+#       that mirrors some asdf plugin's logic to remove version prefixes like  #
+#       "v".                                                                   #
+#                                                                              #
+#       You have to amend the Renovate config when the asdf plugin takes 1.2.3 #
+#       as the version but the Docker tag/Github tag is actually v1.2.3        #
+#                                                                              #
+################################################################################
+#
+
+# /!\ Please maintain this file sorted alphabetically.
+# check it with
+# diff <(sed '/^#/d; /^$/d' .tool-versions | sort) <(sed '/^#/d; /^$/d' .tool-versions) && echo ".tool-versions is sorted correctly" || echo ".tool-versions is not sorted correctly"
+
+# renovate: datasource=github-tags depName=rhysd/actionlint
+actionlint 1.7.11
+
+awscli 2.33.22
+
+delta 0.18.2
+
+# renovate: datasource=github-tags depName=eksctl-io/eksctl
+eksctl 0.223.0
+
+golang 1.26.0
+
+# renovate: datasource=github-tags depName=fullstorydev/grpcurl
+grpcurl 1.9.3
+
+# datasource=custom.helm-camunda depName=helm
+helm 3.20.0
+
+jq 1.7.1
+
+just 1.46.0
+
+# renovate: datasource=github-tags depName=kubernetes-sigs/kind
+kind 0.31.0
+
+kubectl 1.35.1
+
+kustomize 5.8.1 # used by the tests
+
+# renovate: datasource=github-tags depName=FiloSottile/mkcert
+mkcert 1.4.4
+
+pre-commit 4.5.1
+
+python 3.14.3
+
+shellcheck 0.11.0
+
+task 3.30.1  # used by the tests
+
+terraform 1.14.5
+
+terraform-docs 0.21.0
+
+tflint 0.61.0
+
+trivy 0.60.0
+
+yq 4.52.4

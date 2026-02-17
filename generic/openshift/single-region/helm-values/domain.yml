@@ -1,0 +1,50 @@
+---
+# OpenShift Domain Configuration
+#
+# This file contains OpenShift-specific ingress configuration.
+
+global:
+    identity:
+        auth:
+            identity:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/managementidentity
+            console:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/console
+            webModeler:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/modeler
+            optimize:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/optimize
+
+    # the ingress is managed directly by the Route manifests
+    ingress:
+        enabled: true
+        className: openshift-default
+        host: ${CAMUNDA_DOMAIN}
+        tls:
+            enabled: true
+            # explicitly '-' as secret name as we rely on the IngressOperator to handle the TLS secret
+            # if you use a custom certificate, you might want to fill this value
+            secretName: '-'
+        annotations:
+            route.openshift.io/termination: edge
+            # enforce HSTS
+            haproxy.router.openshift.io/hsts_header: max-age=31536000; includeSubDomains;preload
+
+identity:
+    contextPath: /managementidentity
+    fullURL: https://${CAMUNDA_DOMAIN}/managementidentity
+
+webModeler:
+    contextPath: /modeler
+
+optimize:
+    contextPath: /optimize
+
+orchestration:
+    contextPath: /
+
+console:
+    contextPath: /console
+
+connectors:
+    contextPath: /connectors

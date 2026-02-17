@@ -1,0 +1,497 @@
+---
+name: Deploy AWS ROSA HCP Single Region Cluster
+
+description: |
+    This GitHub Action automates the deployment of the aws/openshift/rosa-hcp-single-region reference architecture cluster using Terraform.
+    This action will also install oc, awscli, rosa cli.
+    The kube context will be set on the created cluster.
+    If the cluster is private, a VPN setup can also be configured.
+
+inputs:
+    rh-token:
+        description: Red Hat Hybrid Cloud Console Token
+        required: true
+    cluster-name:
+        description: Name of the ROSA cluster to deploy
+        required: true
+    admin-password:
+        description: Admin password for the ROSA cluster
+        required: true
+    admin-username:
+        description: Admin username for the ROSA cluster
+        default: kube-admin
+        required: true
+    aws-region:
+        description: AWS region where the ROSA cluster will be deployed
+        required: true
+    availability-zones:
+        description: Comma separated list of availability zones (letters only, e.g., a,b,c)
+        required: true
+        default: a,b,c
+    rosa-cli-version:
+        description: Version of the ROSA CLI to use
+        required: true
+        default: latest
+    openshift-version:
+        description: Version of the OpenShift to install
+        required: true
+        # renovate: datasource=custom.rosa-camunda depName=red-hat-openshift versioning=semver
+        default: 4.20.3
+    replicas:
+        description: Number of replicas for the ROSA cluster (empty will fallback on default value of the module)
+        default: ''
+    private-vpc:
+        description: The VPC within which the cluster resides will only have private subnets, meaning that it cannot be accessed at all from the public
+            Internet (empty will fallback on default value of the module)
+        default: ''
+    s3-backend-bucket:
+        description: Name of the S3 bucket to store Terraform state
+        required: true
+    s3-bucket-region:
+        description: Region of the bucket containing the resources states, if not set, will fallback on aws-region
+    s3-bucket-key-prefix:
+        description: Key prefix of the bucket containing the resources states. It must contain a / at the end e.g 'my-prefix/'.
+        default: ''
+    tf-modules-revision:
+        description: Git revision of the tf modules to use
+        default: main
+        required: true
+    tf-modules-path:
+        description: Path where the tf rosa modules will be cloned
+        default: ./.action-tf-modules/aws-openshift-rosa-hcp-single-region-create/
+        required: true
+    login:
+        description: Authenticate the current kube context on the created cluster
+        default: 'true'
+        required: true
+    cleanup-tf-modules-path:
+        description: Whether to clean up the tf modules path
+        default: 'false'
+    tags:
+        description: Tags to apply to the cluster and related resources, in JSON format
+        default: '{}'
+
+    vpn-enabled:
+        description: Enable VPN setup module (recommended when private_vpc is true), this will also configure the current runner to use it
+        default: 'false'
+
+outputs:
+    openshift-server-api:
+        description: The server API URL of the deployed ROSA cluster
+        value: ${{ steps.cluster_info.outputs.cluster_api }}
+
+    openshift-cluster-id:
+        description: The ID of the deployed ROSA cluster
+        value: ${{ steps.terraform_outputs_cluster.outputs.cluster_id }}
+
+    terraform-state-url-cluster:
+        description: URL of the module "cluster" Terraform state file in the S3 bucket
+        value: ${{ steps.init-cluster.outputs.terraform-state-url-cluster }}
+
+    terraform-state-url-vpn:
+        description: URL of the module "vpn" Terraform state file in the S3 bucket
+        value: ${{ steps.init-vpn.outputs.terraform-state-url-vpn }}
+
+
+    vpn-client-configs:
+        description: Map of VPN client configs
+        value: ${{ steps.terraform_outputs_vpn.outputs.vpn_client_configs || '' }}
+    vpn-client-config-file:
+        description: Config file used by the VPN
+        value: ${{ steps.vpn.outputs.vpn_client_config_file || '' }}
+    vpn-endpoint:
+        description: Endpoint of the VPN to access the created cluster
+        value: ${{ steps.terraform_outputs_vpn.outputs.vpn_endpoint || '' }}
+
+
+runs:
+    using: composite
+    steps:
+        - name: Checkout Repository
+          uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+          with:
+              repository: camunda/camunda-deployment-references
+              ref: ${{ inputs.tf-modules-revision }}
+              path: ${{ inputs.tf-modules-path }}
+              fetch-depth: 0
+
+        - name: Install asdf tools with cache for the project
+          uses: camunda/infraex-common-config/./.github/actions/asdf-install-tooling@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+
+        # TODO: when available on asdf, migrate this to it
+        - name: Install ROSA CLI
+          shell: bash
+          working-directory: /tmp
+          run: |
+              set -euo pipefail
+
+              curl -LO "https://mirror.openshift.com/pub/openshift-v4/clients/rosa/${{ inputs.rosa-cli-version }}/rosa-linux.tar.gz"
+              tar -xvf rosa-linux.tar.gz
+              sudo mv rosa /usr/local/bin/rosa
+              chmod +x /usr/local/bin/rosa
+              rm -f rosa-linux.tar.gz
+              rosa version
+
+        - name: Install CLI tools from OpenShift Mirror
+          uses: redhat-actions/openshift-tools-installer@144527c7d98999f2652264c048c7a9bd103f8a82 # v1
+          with:
+              oc: ${{ inputs.openshift-version }}
+
+        - name: Set AWS Region and associated AZs
+          id: construct_azs
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              echo "AWS_REGION=${{ inputs.aws-region }}" | tee -a "$GITHUB_ENV"
+
+              IFS=',' read -r -a az_letters <<< "${{ inputs.availability-zones }}"
+              FULL_AZS=()
+              for az in "${az_letters[@]}"; do
+                FULL_AZS+=("\"${AWS_REGION}${az}\"")  # Add double quotes around each AZ
+              done
+
+              # Join the AZs with commas
+              FULL_AZS_STRING=$(IFS=,; echo "${FULL_AZS[*]}")
+              echo "FULL_AZS=$FULL_AZS_STRING" | tee -a "$GITHUB_ENV"
+
+
+        - name: Login to Red Hat Hybrid Cloud Console
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              rosa login --token="${{ inputs.rh-token }}"
+              rosa whoami
+
+        - name: Verify and enable HCP ROSA on AWS Marketplace
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              rosa verify quota
+              rosa verify permissions
+              rosa create account-roles --mode auto
+
+        - name: Set Terraform variables
+          id: set-terraform-variables
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              export TFSTATE_BUCKET="${{ inputs.s3-backend-bucket }}"
+              export TFSTATE_BASE_KEY="${{ inputs.s3-bucket-key-prefix }}tfstate-${{ inputs.cluster-name }}/"
+
+              if [ -z "${{ inputs.s3-bucket-region }}" ]; then
+                export TFSTATE_REGION="$AWS_REGION"
+              else
+                export TFSTATE_REGION="${{ inputs.s3-bucket-region }}"
+              fi
+
+              echo "TFSTATE_BUCKET=${TFSTATE_BUCKET}" | tee -a "$GITHUB_OUTPUT"
+              echo "TFSTATE_REGION=${TFSTATE_REGION}" | tee -a "$GITHUB_OUTPUT"
+              echo "TFSTATE_BASE_KEY=${TFSTATE_BASE_KEY}" | tee -a "$GITHUB_OUTPUT"
+
+              echo "TF_DIR_CLUSTER=${{ inputs.tf-modules-path }}/aws/openshift/rosa-hcp-single-region/terraform/cluster/" >> "$GITHUB_ENV"
+              echo "TF_DIR_VPN=${{ inputs.tf-modules-path }}/aws/openshift/rosa-hcp-single-region/terraform/vpn/" >> "$GITHUB_ENV"
+
+        - name: Check if S3 bucket exists
+          id: create-s3-bucket
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              if aws s3api head-bucket --bucket ${{ inputs.s3-backend-bucket }} --region ${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }} 2>/dev/null; then
+                echo "Bucket already exists"
+              else
+                echo "Bucket does not exist, creating..."
+                aws s3api create-bucket --bucket ${{ inputs.s3-backend-bucket }} \
+                    --region ${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }} \
+                    --create-bucket-configuration LocationConstraint=${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }}
+              fi
+
+              aws s3api put-public-access-block --bucket ${{ inputs.s3-backend-bucket }} \
+                --region ${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }} \
+                --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+        - name: Terraform Init - Cluster
+          id: init-cluster
+          working-directory: ${{ env.TF_DIR_CLUSTER }}
+          env:
+              RHCS_TOKEN: ${{ inputs.rh-token }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              terraform_state_key="${{ steps.set-terraform-variables.outputs.TFSTATE_BASE_KEY }}cluster.tfstate"
+              terraform_state_url_cluster="s3://${{ steps.set-terraform-variables.outputs.TFSTATE_BUCKET }}/$terraform_state_key"
+              echo "terraform-state-url-cluster=${terraform_state_url_cluster}" | tee -a "$GITHUB_OUTPUT"
+
+              terraform version
+
+              terraform init \
+                -backend-config="bucket=${{ steps.set-terraform-variables.outputs.TFSTATE_BUCKET }}" \
+                -backend-config="key=$terraform_state_key" \
+                -backend-config="region=${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }}"
+
+              terraform validate -no-color
+
+        - name: Sanitize Tags
+          id: sanitize-tags
+          uses: ./.github/actions/internal-sanitize-tags
+          with:
+              raw-tags: ${{ inputs.tags }}
+
+        - name: Generate tfvars file - Cluster
+          id: generate-tfvars-cluster
+          shell: bash
+          working-directory: ${{ env.TF_DIR_CLUSTER }}
+          run: |
+              set -euo pipefail
+
+              cat > terraform.tfvars <<EOF
+              default_tags = ${{ steps.sanitize-tags.outputs.sanitized_tags }}
+              EOF
+
+        - name: Terraform Plan - Cluster
+          id: plan-cluster
+          working-directory: ${{ env.TF_DIR_CLUSTER }}
+          env:
+              RHCS_TOKEN: ${{ inputs.rh-token }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              echo "Adapting the files with input values"
+              pwd
+              ls
+
+              # protect sensitive values
+              echo "::add-mask::${{ inputs.admin-password }}"
+
+              # We use sed instead of -var because the module presented to the user
+              # uses locals for simplicity. Locals cannot be overwritten with the CLI.
+              sed -i -e 's/\(rosa_cluster_name\s*=\s*"\)[^"]*\("\)/\1${{ inputs.cluster-name }}\2/' \
+                     -e 's/\(rosa_admin_password\s*=\s*"\)[^"]*\("\)/\1${{ inputs.admin-password }}\2/' \
+                     -e 's/\(rosa_admin_username\s*=\s*"\)[^"]*\("\)/\1${{ inputs.admin-username }}\2/' \
+                     -e 's/\(openshift_version\s*=\s*"\)[^"]*\("\)/\1${{ inputs.openshift-version }}\2/' \
+                     -e "s/\(rosa_cluster_zones\s*=\s*\)[^]]*\]/\1[$FULL_AZS]/" \
+                     cluster.tf
+
+              if [ -n "${{ inputs.replicas }}" ]; then
+                sed -i -e 's/\(replicas\s*=\s*\)[0-9]\+/\1${{ inputs.replicas }}/' cluster.tf
+              else
+                echo "No replicas value provided, skipping replica modification."
+              fi
+
+              if [ -n "${{ inputs.private-vpc }}" ]; then
+                sed -i -E "s/(^\s*rosa_private_cluster\s*=\s*)[a-z]+/\1${{ inputs.private-vpc }}/" cluster.tf
+              else
+                echo "No private-vpc value provided, skipping private modification."
+              fi
+
+              echo "Displaying templated cluster.tf file:"
+              cat cluster.tf
+
+              terraform plan -no-color -var-file=terraform.tfvars -out rosa.plan
+
+        - name: Terraform Apply - Cluster
+          id: apply-cluster
+          working-directory: ${{ env.TF_DIR_CLUSTER }}
+          env:
+              RHCS_TOKEN: ${{ inputs.rh-token }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              terraform apply -no-color rosa.plan
+
+        - name: Export Terraform Outputs - Cluster
+          id: terraform_outputs_cluster
+          working-directory: ${{ env.TF_DIR_CLUSTER }}
+          shell: bash
+          run: |
+              source "${{ github.workspace }}/.github/scripts/gha-functions.sh"
+              export_terraform_outputs
+
+        - name: Terraform Drift Detection - Cluster
+          uses: ./.github/actions/internal-terraform-drift-detect
+          id: drift-detect-cluster
+          with:
+              working-directory: ${{ env.TF_DIR_CLUSTER }}
+              plan-extra-args: |
+                  -var-file=terraform.tfvars
+              fail-on-drift: 'false' # not failing on drift as there may be an expected drift due to hcp module drifting - cluster_console_url
+          env:
+              RHCS_TOKEN: ${{ inputs.rh-token }}
+
+        - name: Terraform Init - VPN
+          id: init-vpn
+          if: inputs.vpn-enabled == 'true'
+          working-directory: ${{ env.TF_DIR_VPN }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              terraform_state_key="${{ steps.set-terraform-variables.outputs.TFSTATE_BASE_KEY }}vpn.tfstate"
+              terraform_state_url_vpn="s3://${{ steps.set-terraform-variables.outputs.TFSTATE_BUCKET }}/$terraform_state_key"
+              echo "terraform-state-url-vpn=${terraform_state_url_vpn}" | tee -a "$GITHUB_OUTPUT"
+
+              terraform version
+
+              terraform init \
+                -backend-config="bucket=${{ steps.set-terraform-variables.outputs.TFSTATE_BUCKET }}" \
+                -backend-config="key=$terraform_state_key" \
+                -backend-config="region=${{ steps.set-terraform-variables.outputs.TFSTATE_REGION }}"
+
+              terraform validate -no-color
+
+        - name: Generate tfvars file - VPN
+          id: generate-tfvars-vpn
+          shell: bash
+          working-directory: ${{ env.TF_DIR_VPN }}
+          run: |
+              set -euo pipefail
+
+              cat > terraform.tfvars <<EOF
+              default_tags = ${{ steps.sanitize-tags.outputs.sanitized_tags }}
+              vpc_id="${{ steps.terraform_outputs_cluster.outputs.vpc_id }}"
+              EOF
+
+        - name: Terraform Plan - VPN
+          id: plan-vpn
+          if: inputs.vpn-enabled == 'true'
+          working-directory: ${{ env.TF_DIR_VPN }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              echo "Adapting the files with input values"
+              pwd
+              ls
+
+              sed -i -E \
+                -e "s/(^\s*vpn_name\s*=\s*\")[^\"]*(\")/\1${{ inputs.cluster-name }}-vpn\2/" \
+                vpn.tf
+
+              echo "Displaying templated vpn.tf file:"
+              cat vpn.tf
+
+              terraform plan -no-color \
+                -var-file=terraform.tfvars \
+                -out vpn.plan
+
+        - name: Terraform Apply - VPN
+          id: apply-vpn
+          if: inputs.vpn-enabled == 'true'
+          working-directory: ${{ env.TF_DIR_VPN }}
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              terraform apply -no-color vpn.plan
+
+        - name: Export Terraform Outputs - VPN
+          id: terraform_outputs_vpn
+          if: inputs.vpn-enabled == 'true'
+          working-directory: ${{ env.TF_DIR_VPN }}
+          shell: bash
+          run: |
+              source "${{ github.workspace }}/.github/scripts/gha-functions.sh"
+              export_terraform_outputs
+
+        - name: Terraform Drift Detection - VPN
+          id: drift-detect-vpn
+          if: inputs.vpn-enabled == 'true'
+          uses: ./.github/actions/internal-terraform-drift-detect
+          with:
+              working-directory: ${{ env.TF_DIR_VPN }}
+              plan-extra-args: |
+                  -var-file=terraform.tfvars
+
+        ### End of terraform
+
+        - name: Retrieve cluster information
+          id: cluster_info
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              rosa describe cluster --output=json -c "${{ steps.terraform_outputs_cluster.outputs.cluster_id }}"
+              export cluster_api=$(rosa describe cluster --output=json -c "${{ steps.terraform_outputs_cluster.outputs.cluster_id }}" | jq -r '.api.url')
+              echo "cluster_api=$cluster_api"
+              echo "cluster_api=$cluster_api" >> "$GITHUB_OUTPUT"
+
+        - name: Configure VPN Client if enabled
+          id: vpn
+          shell: bash
+          if: inputs.vpn-enabled == 'true'
+          run: |
+              sudo apt update
+              sudo apt install -y openvpn openvpn-systemd-resolved
+
+              client_name="my-client" # the client name is hard-coded in the reference
+              config=$(echo '${{ steps.terraform_outputs_vpn.outputs.vpn_client_configs }}' | jq -r --arg client "$client_name" '.[$client]')
+
+              # Create a secure directory inside the GitHub workspace
+              mkdir -p "$GITHUB_WORKSPACE/.vpn"
+              vpn_client_config_file="$GITHUB_WORKSPACE/.vpn/client.ovpn"
+
+              # Create the client's config file
+              echo "$config" > "$vpn_client_config_file"
+              echo "vpn_client_config_file=$vpn_client_config_file" | tee -a "$GITHUB_OUTPUT"
+
+        - name: Connect to VPN
+          if: inputs.vpn-enabled == 'true'
+          uses: kota65535/github-openvpn-connect-action@cd2ed8a90cc7b060dc4e001143e811b5f7ea0af5 # v3.1.0
+          with:
+              config_file: ${{ steps.vpn.outputs.vpn_client_config_file }}
+              echo_config: 'false'
+
+        - name: Login and generate kubeconfig
+          # we need to retry due as the cluster has just been created and the OIDC provider may not be available yet
+          uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3
+          id: kube_config
+          if: inputs.login == 'true'
+          with:
+              timeout_minutes: 10
+              max_attempts: 40
+              shell: bash
+              retry_wait_seconds: 15
+              command: |
+                  : # see https://github.com/nick-fields/retry/issues/133
+                  set -o errexit
+                  set -o pipefail
+
+                  # protect sensitive values
+                  echo "::add-mask::${{ inputs.admin-password }}"
+
+                  # Check if the user is already a cluster-admin
+                  if ! rosa list users --cluster="${{ inputs.cluster-name }}" | grep -q "${{ inputs.admin-username }}"; then
+                    rosa grant user cluster-admin --cluster="${{ inputs.cluster-name }}" --user="${{ inputs.admin-username }}"
+                  else
+                    echo "✅ User '${{ inputs.admin-username }}' is already a cluster-admin on '${{ inputs.cluster-name }}'."
+                  fi
+
+                  oc login --username "${{ inputs.admin-username }}" --password "${{ inputs.admin-password }}" "${{ steps.cluster_info.outputs.cluster_api }}"
+                  oc whoami
+
+                  echo "Show existing contexts"
+                  kubectl config get-contexts
+                  if kubectl config get-contexts -o name | grep -qx '${{ inputs.cluster-name }}'; then
+                      echo "Context '${{ inputs.cluster-name }}' already exists. No changes made."
+                  else
+                      echo "Renaming oc config current context to '${{ inputs.cluster-name }}'"
+                      kubectl config delete-context '${{ inputs.cluster-name }}' 2>/dev/null || true
+                      kubectl config rename-context "$(oc config current-context)" "${{ inputs.cluster-name }}"
+                  fi
+
+                  kubectl config use "${{ inputs.cluster-name }}"
+
+        - name: Clean up cloned modules
+          if: always() && inputs.cleanup-tf-modules-path == 'true'
+          shell: bash
+          run: |
+              set -euo pipefail
+
+              rm -rf "${{ inputs.tf-modules-path }}"

@@ -1,0 +1,864 @@
+---
+name: Tests - Integration - Azure Kubernetes AKS Single Region
+
+permissions:
+    id-token: write # this is required for azure login
+    contents: write # allow commits
+    pull-requests: write # allow comments, labels (used by internal-apply-skip-label)
+
+on:
+    schedule:
+        - cron: 0 3 * * 3 # Runs at 3 AM on Wednesdays
+    pull_request:
+        paths:
+            - .github/workflows/azure_kubernetes_aks_single_region_tests.yml
+            - .tool-versions
+            - generic/kubernetes/single-region/**
+            - azure/kubernetes/aks-single-region/**
+            - azure/modules/**
+            - generic/kubernetes/single-region/procedure/**
+            - '!azure/kubernetes/aks-single-region/test/golden/**'
+            - .github/actions/azure-kubernetes-aks-single-region-create/**
+            - .github/actions/azure-kubernetes-aks-single-region-cleanup/**
+            - .github/actions/azure-kubernetes-ingress-setup/**
+            - .github/actions/internal-terraform-drift-detect/**
+            - .github/actions/internal-clean-namespace/**
+            - .github/actions/kubernetes-restart-coredns/**
+            - .github/actions/kubernetes-wildcard-certificate/**
+            - .github/actions/internal-camunda-chart-tests/**
+
+    workflow_dispatch:
+        inputs:
+            delete_clusters:
+                description: Whether to delete the clusters.
+                type: boolean
+                default: true
+            enable_tests:
+                description: Whether to enable the tests.
+                type: boolean
+                default: true
+            cluster_name:
+                description: Name of the cluster to deploy.
+                type: string
+                required: false
+            resource-group-name:
+                description: Name of the resource group.
+                type: string
+                required: false
+            resource-prefix:
+                description: Prefix for the resource names.
+                type: string
+                required: false
+            ref-arch:
+                description: |
+                    Reference architecture to use, can only deploy one at a time.
+                    Use a different trigger with unique names for each ref-arch.
+                    Currently supported: aks-single-region
+                    Only for workflow_dispatch.
+                required: false
+                type: string
+                default: aks-single-region
+            use_wildcard_cert:
+                description: Use wildcard certificate from Vault instead of ACME/Let's Encrypt
+                type: boolean
+                default: false
+
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    # we don't cancel the previous run, so it can finish it and let clusters in a proper state
+    cancel-in-progress: false
+
+env:
+    IS_SCHEDULE: ${{ (contains(github.head_ref, 'schedules/') || github.event_name == 'schedule') && 'true' || 'false' }}
+    IS_RENOVATE_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login == 'renovate[bot]' }}
+
+    # terraform statefile is to be stored in an AWS S3 bucket to benefit from existing automated cleanup capabilities
+    # AWS itself is not used to deploy resources, only Azure
+    AWS_PROFILE: infraex
+    AWS_REGION: eu-central-1
+    S3_BACKEND_BUCKET: tests-ra-aws-rosa-hcp-tf-state-eu-central-1
+    S3_BUCKET_REGION: eu-central-1
+    TLD: azure.camunda.ie
+    MAIL_OVERWRITE: admin@camunda.ie
+    AZURE_DNS_RESOURCE_GROUP: rg-infraex-global-permanent
+
+
+    # Test environment for cloud provider, please keep it synced between the workflows
+    AZURE_REGION: swedencentral
+
+    CLEANUP_CLUSTERS: ${{ github.event.inputs.delete_clusters || 'true' }}
+
+    # TEST VARIABLES
+
+    CI_MATRIX_FILE: .github/workflows-config/azure-kubernetes-aks-single-region/test_matrix.yml
+    # Docker Hub auth to avoid image pull rate limit.
+    # Vars with "TEST_" prefix are used in the test runner tool (Task).
+    TESTS_ENABLED: ${{ github.event.inputs.enable_tests || 'true' }}
+
+    # renovate: datasource=github-tags depName=camunda/camunda-platform-helm
+    # TODO: resolve this branch when merging to playwright <8.8>
+    TESTS_CAMUNDA_HELM_CHART_REPO_REF: fix-venom-8-8   # git reference used to clone the camunda/camunda-platform-helm repository to perform the tests
+    TESTS_CAMUNDA_HELM_CHART_REPO_PATH: ./.camunda_helm_repo   # where to clone it
+
+    # Optional components that are not enabled by default in the doc
+    WEBMODELER_ENABLED: 'true'
+    CONSOLE_ENABLED: 'true'
+
+jobs:
+    triage:
+        runs-on: ubuntu-latest
+        outputs:
+            should_skip: ${{ steps.skip_check.outputs.should_skip }}
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+            - name: Check labels
+              id: skip_check
+              uses: ./.github/actions/internal-triage-skip
+
+    clusters-info:
+        name: Generate test matrix
+        runs-on: ubuntu-latest
+        needs: triage
+        if: needs.triage.outputs.should_skip == 'false'
+        outputs:
+            platform-matrix: ${{ steps.gen.outputs.platform_matrix }}
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+            - name: Generate Tests Matrix
+              id: gen
+              uses: ./.github/actions/internal-tests-matrix
+              with:
+                  ci_matrix_file: ${{ env.CI_MATRIX_FILE }}
+                  is_schedule: ${{ env.IS_SCHEDULE }}
+                  is_renovate_pr: ${{ env.IS_RENOVATE_PR }}
+
+                  ref_arch: ${{ inputs.ref-arch }}
+                  cluster_name: ${{ inputs.cluster_name }}
+    prepare-clusters:
+        name: Prepare clusters
+        needs:
+            - clusters-info
+        strategy:
+            fail-fast: false
+            matrix:
+                distro: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).distro }}
+                scenario: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).scenario }}
+        runs-on: ubuntu-latest
+        env:
+            TF_MODULES_PATH: ./.action-tf-modules/azure-kubernetes-${{ matrix.scenario.name }}-create/
+            CAMUNDA_NAMESPACE: camunda
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+              with:
+                  ref: ${{ github.ref }}
+                  fetch-depth: 0
+
+            - name: Install asdf tools with cache
+              uses: camunda/infraex-common-config/./.github/actions/asdf-install-tooling@e853095bfdbba311ec456782649562e4f1613a3b # main
+
+            - name: Import Secrets
+              id: secrets
+              uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3
+              with:
+                  url: ${{ secrets.VAULT_ADDR }}
+                  method: approle
+                  roleId: ${{ secrets.VAULT_ROLE_ID }}
+                  secretId: ${{ secrets.VAULT_SECRET_ID }}
+                  exportEnv: false
+                  secrets: |
+                      secret/data/products/infrastructure-experience/ci/common AZURE_CLIENT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_TENANT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_SUBSCRIPTION_ID;
+                      secret/data/products/infrastructure-experience/ci/common CI_ENCRYPTION_KEY;
+
+            - name: Configure AWS CLI
+              uses: ./.github/actions/aws-configure-cli
+              with:
+                  vault-addr: ${{ secrets.VAULT_ADDR }}
+                  vault-role-id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault-secret-id: ${{ secrets.VAULT_SECRET_ID }}
+                  aws-profile: ${{ env.AWS_PROFILE }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Azure Login with OIDC
+              uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+              timeout-minutes: 10
+              with:
+                  client-id: ${{ steps.secrets.outputs.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ steps.secrets.outputs.AZURE_TENANT_ID }}
+                  subscription-id: ${{ steps.secrets.outputs.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Set current target branch
+              id: target-branch
+              run: |
+                  set -euo pipefail
+                  TARGET_BRANCH=$(cat .target-branch)
+                  echo "TARGET_BRANCH=$TARGET_BRANCH" | tee -a "$GITHUB_OUTPUT"
+            - name: Export S3_BACKEND_BUCKET
+              id: s3_prefix
+              run: |
+                  set -euo pipefail
+                  echo "S3_BACKEND_BUCKET_PREFIX=azure/kubernetes/${{ matrix.scenario.name }}/" | tee -a "$GITHUB_OUTPUT"
+
+            - name: Create terraform.tfvars file
+              id: create-tfvars
+              working-directory: ${{ github.workspace }}/azure/kubernetes/${{ matrix.scenario.name }}
+              timeout-minutes: 10
+              run: |
+                  set -euo pipefail
+                  export AZURE_SP_ID=$(az account show --query user.name -o tsv)
+                  ${{ github.workspace }}/azure/kubernetes/${{ matrix.scenario.name }}/procedure/tfvars-domain.sh
+
+            - name: Create K8S cluster and login
+              uses: ./.github/actions/azure-kubernetes-aks-single-region-create
+              id: create_cluster
+              # Do not interrupt tests; otherwise, the Terraform state may become inconsistent.
+              if: always() && success()
+              timeout-minutes: 120
+              with:
+                  resource-prefix: ${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}
+                  cluster-name: ${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}-aks
+                  resource-group-name: ${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}-rg
+                  location: ${{ env.AZURE_REGION }}
+                  s3-backend-bucket: ${{ env.S3_BACKEND_BUCKET }}
+                  s3-bucket-region: ${{ env.S3_BUCKET_REGION }}
+                  s3-bucket-key-prefix: ${{ steps.s3_prefix.outputs.S3_BACKEND_BUCKET_PREFIX }}${{ steps.target-branch.outputs.TARGET_BRANCH }}/
+                  tf-modules-revision: ${{ github.ref }}
+                  tf-modules-path: ${{ env.TF_MODULES_PATH }}
+                  tfvars: ${{ github.workspace }}/azure/kubernetes/${{ matrix.scenario.name }}/terraform.tfvars
+                  ref-arch: ${{ matrix.scenario.name }}
+                  tags: >
+                      {
+                        "ci-run-id": "${{ github.run_id }}",
+                        "ci-run-number": "${{ github.run_number }}",
+                        "ci-workflow": "${{ github.workflow }}",
+                        "ci-actor": "${{ github.actor }}",
+                        "ci-ref": "${{ github.ref }}",
+                        "ci-commit": "${{ github.sha }}",
+                        "ci-repo": "${{ github.repository }}",
+                        "ci-event": "${{ github.event_name }}"
+                      }
+
+            - name: Source env from Terraform
+              id: db_env
+              working-directory: ${{ env.TF_MODULES_PATH }}/azure/kubernetes/${{ matrix.scenario.name }}/
+              timeout-minutes: 10
+              run: |
+                  set -euo pipefail
+
+                  # Source the shell script that exports your DB-related variables
+                  # shellcheck disable=SC2086
+                  source ${{ github.workspace }}/azure/kubernetes/${{ matrix.scenario.name }}/procedure/vars-create-db.sh
+
+                  {
+                    echo "DB_HOST=$DB_HOST"
+                    echo "DB_PORT=$DB_PORT"
+                    echo "POSTGRES_ADMIN_USERNAME=$POSTGRES_ADMIN_USERNAME"
+                    echo "POSTGRES_ADMIN_PASSWORD=$POSTGRES_ADMIN_PASSWORD"
+                    echo "DB_IDENTITY_NAME=$DB_IDENTITY_NAME"
+                    echo "DB_IDENTITY_USERNAME=$DB_IDENTITY_USERNAME"
+                    echo "DB_IDENTITY_PASSWORD=$DB_IDENTITY_PASSWORD"
+                    echo "DB_WEBMODELER_NAME=$DB_WEBMODELER_NAME"
+                    echo "DB_WEBMODELER_USERNAME=$DB_WEBMODELER_USERNAME"
+                    echo "DB_WEBMODELER_PASSWORD=$DB_WEBMODELER_PASSWORD"
+                  } > "${{ runner.temp }}/outputs_raw"
+
+            - name: Export other secrets from the action
+              id: encrypt_outputs
+              if: always()
+              uses: ./.github/actions/internal-generic-encrypt-export
+              with:
+                  file_path: ${{ runner.temp }}/outputs_raw
+                  encryption_key: ${{ steps.secrets.outputs.CI_ENCRYPTION_KEY }}
+
+            # Write for matrix outputs workaround
+            - uses: cloudposse/github-action-matrix-outputs-write@ed06cf3a6bf23b8dce36d1cf0d63123885bb8375 # v1
+              if: always()
+              id: out
+              with:
+                  matrix-step-name: ${{ github.job }}
+                  matrix-key: ${{ matrix.distro.name }}-${{ matrix.scenario.name }}
+                  outputs: |-
+                      outputs_raw: ${{ steps.encrypt_outputs.outputs.encrypted_file_base64 }}
+
+    access-info:
+        name: Read outputs from matrix
+        runs-on: ubuntu-latest
+        if: always()
+        needs: prepare-clusters
+        outputs:
+            config: ${{ steps.read-workflow.outputs.result }}
+        steps:
+            - uses: cloudposse/github-action-matrix-outputs-read@33cac12fa9282a7230a418d859b93fdbc4f27b5a # v1
+              id: read-workflow
+              with:
+                  matrix-step-name: prepare-clusters
+
+    integration-tests:
+        name: Run integration tests
+        runs-on: ubuntu-latest
+        concurrency:
+            # instead of running sequentially in a matrix, we use concurrency to run the different scenarios
+            # in parallel but the declinations sequentially
+            # max-parallel would limit us to run 1 matrix job but this way we can run 2 jobs in parallel.
+            group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.distro.name }}-${{ matrix.scenario.name }}
+            cancel-in-progress: false
+        needs:
+            - prepare-clusters
+            - clusters-info
+            - access-info
+        strategy:
+            fail-fast: false
+            matrix:
+                distro: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).distro }}
+                scenario: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).scenario }}
+                declination: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).declination }}
+
+        env:
+            # https://github.com/camunda/camunda-platform-helm/blob/test/integration/scenarios/chart-full-setup/Taskfile.yaml#L12C15-L12C32
+            TEST_CLUSTER_TYPE: kubernetes
+            # Do not change this secret name without updating manifests that reference this TLS secret
+            WILDCARD_TLS_SECRET_NAME: camunda-c8-tls
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+            - name: Install asdf tools with cache for the project
+              uses: camunda/infraex-common-config/./.github/actions/asdf-install-tooling@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+
+            - name: Import Secrets
+              id: secrets
+              uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3
+              with:
+                  url: ${{ secrets.VAULT_ADDR }}
+                  method: approle
+                  roleId: ${{ secrets.VAULT_ROLE_ID }}
+                  secretId: ${{ secrets.VAULT_SECRET_ID }}
+                  exportEnv: false
+                  secrets: |
+                      secret/data/products/infrastructure-experience/ci/common DOCKERHUB_USER;
+                      secret/data/products/infrastructure-experience/ci/common DOCKERHUB_PASSWORD;
+                      secret/data/products/infrastructure-experience/ci/common CI_CAMUNDA_USER_TEST_CLIENT_ID;
+                      secret/data/products/infrastructure-experience/ci/common CI_CAMUNDA_USER_TEST_CLIENT_SECRET;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_CLIENT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_TENANT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_SUBSCRIPTION_ID;
+                      secret/data/products/infrastructure-experience/ci/common CI_ENCRYPTION_KEY;
+                      secret/data/products/infrastructure-experience/ci/common MACHINE_USR;
+                      secret/data/products/infrastructure-experience/ci/common MACHINE_PWD;
+
+
+            - name: 🚢 Retrieve environment variables from outputs
+              uses: ./.github/actions/internal-generic-decrypt-import
+              with:
+                  output_path: ${{ runner.temp }}/outputs_raw
+                  encrypted_file_base64: >
+                      ${{ fromJson(needs.access-info.outputs.config).outputs_raw[
+                        format(
+                          '{0}-{1}',
+                          matrix.distro.name,
+                          matrix.scenario.name
+                        )
+                      ] }}
+                  encryption_key: ${{ steps.secrets.outputs.CI_ENCRYPTION_KEY }}
+
+            - name: 🚢 Export outputs as environment variables
+              timeout-minutes: 3
+              run: |
+                  set -euo pipefail
+                  source .github/scripts/gha-functions.sh
+                  export_file_to_github_env "${{ runner.temp }}/outputs_raw"
+
+            - name: Configure AWS CLI
+              uses: ./.github/actions/aws-configure-cli
+              with:
+                  vault-addr: ${{ secrets.VAULT_ADDR }}
+                  vault-role-id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault-secret-id: ${{ secrets.VAULT_SECRET_ID }}
+                  aws-profile: ${{ env.AWS_PROFILE }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Azure Login with OIDC
+              uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+              timeout-minutes: 10
+              with:
+                  client-id: ${{ steps.secrets.outputs.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ steps.secrets.outputs.AZURE_TENANT_ID }}
+                  subscription-id: ${{ steps.secrets.outputs.AZURE_SUBSCRIPTION_ID }}
+
+            - name: 🔐 Login into the cluster
+              timeout-minutes: 10
+              run: |
+                  # TODO: this is supposed to be part of the action that creates the cluster
+                  # in the tests, we are supposed to use the exported kubeconfig
+                  set -euo pipefail
+                  az aks get-credentials --resource-group "${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}-rg" \
+                    --name "${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}-aks" --overwrite-existing
+
+                  kubectl config current-context
+                  kubectl get nodes
+            - name: 🌱 Register chart setup environment values
+              timeout-minutes: 3
+              run: |
+                  set -euo pipefail
+
+                  # the chart env should be loaded by the client at the very first step of his installation
+                  source .github/scripts/gha-functions.sh
+                  export_new_env_vars generic/kubernetes/single-region/procedure/chart-env.sh
+
+
+            - name: 🏗️ Clean and recreate Camunda namespace
+              uses: ./.github/actions/internal-clean-namespace
+              timeout-minutes: 20
+              with:
+                  namespace: ${{ env.CAMUNDA_NAMESPACE }}
+                  recreate: 'true'
+
+            - name: Wait for cluster stability
+              run: sleep 30
+
+            - name: 🧹 Clean up databases
+              timeout-minutes: 20
+              run: |
+                  set -euo pipefail
+
+                  "${GITHUB_WORKSPACE}/azure/kubernetes/${{ matrix.scenario.name }}/procedure/create-setup-db-secret.sh"
+
+                  # Reset PostgreSQL
+                  kubectl apply -f ./azure/kubernetes/${{ matrix.scenario.name }}/manifests/reset-postgres.yml --namespace "$CAMUNDA_NAMESPACE"
+
+                  # Wait for the job to complete
+                  while true; do
+                      STATUS=$(kubectl get job reset-azure-postgres --namespace "$CAMUNDA_NAMESPACE" -o jsonpath='{.status.succeeded}')
+
+                      if [[ "$STATUS" == "1" ]]; then
+                          echo "Job completed successfully."
+                          break
+                      fi
+
+                      echo "Waiting for job to complete..."
+                      sleep 5
+                  done
+                  echo "[DEBUG] Job log:"
+                  kubectl logs job/reset-azure-postgres --namespace "$CAMUNDA_NAMESPACE"
+                  kubectl delete job reset-azure-postgres --namespace "$CAMUNDA_NAMESPACE"
+
+                  kubectl delete secret setup-db-secret --namespace "$CAMUNDA_NAMESPACE"
+
+            # Use wildcard certificates from Vault instead of ACME/Let's Encrypt
+            # This is useful during testing phase to avoid Let's Encrypt rate limits (max 50 certificates per week)
+            - name: Configure wildcard certificate usage
+              id: cert-config
+              uses: ./.github/actions/internal-configure-wildcard-cert
+              with:
+                  manual-wildcard-cert: ${{ github.event.inputs.use_wildcard_cert }}
+                  is-renovate-pr: ${{ env.IS_RENOVATE_PR }}
+                  is-schedule: ${{ env.IS_SCHEDULE }}
+                  base-ref: ${{ github.base_ref }}
+
+            - name: 🏗️ Ingress Setup prerequisites
+              if: ${{ matrix.declination.name == 'domain' }}
+              timeout-minutes: 20
+              uses: ./.github/actions/azure-kubernetes-ingress-setup
+              with:
+                  cluster-name: ${{ matrix.distro.clusterName }}
+                  scenario-short-name: ${{ matrix.scenario.shortName }}
+                  scenario-name: ${{ matrix.scenario.name }}
+                  mail: ${{ env.MAIL_OVERWRITE }}
+                  tld: ${{ env.TLD }}
+                  azure-dns-resource-group: ${{ env.AZURE_DNS_RESOURCE_GROUP }}
+                  azure-subscription-id: ${{ steps.secrets.outputs.AZURE_SUBSCRIPTION_ID }}
+                  use-wildcard-cert: ${{ steps.cert-config.outputs.use-wildcard-cert }}
+                  wildcard-cert-namespace: ${{ env.CAMUNDA_NAMESPACE }}
+                  wildcard-cert-secret-name: ${{ env.WILDCARD_TLS_SECRET_NAME }}
+                  vault-addr: ${{ secrets.VAULT_ADDR }}
+                  vault-role-id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault-secret-id: ${{ secrets.VAULT_SECRET_ID }}
+
+            - name: 🛠️ Assemble deployment values of azure/kubernetes/${{ matrix.scenario.name }}/${{ matrix.declination.name }}
+              timeout-minutes: 10
+              run: |
+                  set -o errexit
+                  set -euxo pipefail
+
+                  echo "Construct the values.yml file"
+
+                  # Get the Camunda version to determine the correct values-enterprise.yaml file
+                  CAMUNDA_VERSION=$(cat .camunda-version)
+                  echo "Using Camunda version: $CAMUNDA_VERSION"
+
+                  # TODO: In the future, we should pass values-enterprise.yaml directly to helm install command
+                  # using the -f flag as documented in the official Camunda documentation:
+                  # However, we cannot update the procedure documentation yet, so we download and merge manually for now.
+
+                  # Download values-enterprise.yaml from the corresponding chart version
+                  # This follows the best practice of using enterprise images for Camunda components.
+                  # For third-party images (e.g., Bitnami charts like PostgreSQL, Keycloak),
+                  # values-enterprise.yaml already points to enterprise-supported registries when available.
+                  # This configuration is applied in both test and non-test scenarios to ensure consistency.
+                  curl -fsSL \
+                    "https://raw.githubusercontent.com/camunda/camunda-platform-helm/refs/heads/main/charts/camunda-platform-${CAMUNDA_VERSION}/values-enterprise.yaml" \
+                    -o ./values.yml
+
+                  # Merge with specific azure/kubernetes values
+                  yq ". *+ load(\"azure/kubernetes/${{ matrix.scenario.name }}/helm-values/values-${{ matrix.declination.name }}.yml\")" values.yml > values-result.yml
+                  cat values-result.yml && mv values-result.yml values.yml
+
+                  # Merge auth provider specific overlays (keycloak-operator or OIDC)
+                  AUTH_PROVIDER="${{ matrix.scenario.auth_provider }}"
+                  HELM_VALUES_PATH="generic/kubernetes/single-region/helm-values"
+
+                  if [[ "$AUTH_PROVIDER" == "oidc" ]]; then
+                    echo "Applying OIDC auth overlays"
+                    yq ". *+ load(\"${HELM_VALUES_PATH}/values-oidc.yml\")" values.yml > values-merged.yml
+                    yq ". *+ load(\"${HELM_VALUES_PATH}/values-oidc-${{ matrix.declination.name }}.yml\")" values-merged.yml > values-merged2.yml
+                    cat values-merged2.yml && mv values-merged2.yml values.yml && rm values-merged.yml
+
+                  elif [[ "$AUTH_PROVIDER" == "keycloak-operator" ]]; then
+                    echo "Merging operator-based Keycloak config for Keycloak Operator"
+                    OPERATOR_KEYCLOAK_PATH="generic/kubernetes/operator-based/keycloak"
+                    yq ". *+ load(\"${OPERATOR_KEYCLOAK_PATH}/camunda-keycloak-${{ matrix.declination.name }}-values.yml\")" values.yml > values-merged.yml
+                    cat values-merged.yml && mv values-merged.yml values.yml
+
+                    # Merge identity secrets configuration for keycloak-operator auth
+                    yq ". *+ load(\"generic/kubernetes/operator-based/tests/utils/camunda-values-identity-secrets.yml\")" values.yml > values-merged.yml
+                    cat values-merged.yml && mv values-merged.yml values.yml
+
+                  else
+                    echo "Error: unsupported auth_provider '$AUTH_PROVIDER'. Supported: oidc, keycloak-operator" >&2
+                    exit 1
+                  fi
+
+                  if [[ "${{ matrix.declination.name }}" == "domain" ]]; then
+                    export CAMUNDA_DOMAIN="${{ matrix.distro.clusterName }}-${{ matrix.scenario.shortName }}.${{ env.TLD }}"
+                    echo "CAMUNDA_DOMAIN=$CAMUNDA_DOMAIN" | tee -a "$GITHUB_ENV"
+
+                    export CAMUNDA_DOMAIN_GRPC="zeebe-$CAMUNDA_DOMAIN:443"
+                    echo "CAMUNDA_DOMAIN_GRPC=$CAMUNDA_DOMAIN_GRPC" | tee -a "$GITHUB_ENV"
+                  fi
+
+
+                  if [ "$WEBMODELER_ENABLED" == "true" ]; then
+                    echo "Enabling WebModeler"
+                    yq -i '.webModeler.enabled = true' values.yml
+                  fi
+
+                  if [ "$CONSOLE_ENABLED" == "true" ]; then
+                    echo "Enabling Console"
+                    yq -i '.console.enabled = true' values.yml
+                  fi
+
+                  # If using wildcard certificate, remove cert-manager annotations from values
+                  if [[ "${{ steps.cert-config.outputs.use-wildcard-cert }}" == "true" && "${{ matrix.declination.name }}" == "domain" ]]; then
+                      echo "Removing cert-manager annotations from Helm values (using wildcard certificate)"
+                      echo "Using wildcard TLS secret: ${{ env.WILDCARD_TLS_SECRET_NAME }}"
+                      yq eval '
+                        del(.global.ingress.annotations."kubernetes.io/tls-acme") |
+                        del(.global.ingress.annotations."cert-manager.io/cluster-issuer") |
+                        .global.ingress.tls.secretName = "${{ env.WILDCARD_TLS_SECRET_NAME }}" |
+                        del(.orchestration.ingress.grpc.annotations."kubernetes.io/tls-acme") |
+                        del(.orchestration.ingress.grpc.annotations."cert-manager.io/cluster-issuer") |
+                        .orchestration.ingress.grpc.tls.secretName = "${{ env.WILDCARD_TLS_SECRET_NAME }}"
+                      ' values.yml > values-temp.yml
+                      mv values-temp.yml values.yml
+                      echo "Cert-manager annotations removed and wildcard TLS secret configured for HTTP and gRPC ingress"
+                  fi
+
+                  # Apply registry-harbor configuration (used in all scenarios for better performance)
+                  yq ". *+ load(\"generic/kubernetes/single-region/tests/helm-values/registry-harbor.yml\")" values.yml > values-result.yml
+                  cat values-result.yml && mv values-result.yml values.yml
+
+                  # Add integration tests specific values
+                  if [ "$TESTS_ENABLED" == "true" ]; then
+                  yq ". *+ load(\"generic/kubernetes/single-region/tests/helm-values/identity.yml\")" values.yml > values-result.yml
+                  cat values-result.yml && mv values-result.yml values.yml
+                  fi
+
+                  ./generic/kubernetes/single-region/procedure/assemble-envsubst-values.sh
+
+            - name: 🛠️ Configure the PSQL database and associated access
+              timeout-minutes: 10
+              run: |
+                  set -euo pipefail
+                  ./azure/kubernetes/${{ matrix.scenario.name }}/procedure/check-env-variables.sh
+                  ./azure/kubernetes/${{ matrix.scenario.name }}/procedure/create-setup-db-secret.sh
+
+                  kubectl apply -f ./azure/kubernetes/${{ matrix.scenario.name }}/manifests/setup-postgres-create-db.yml --namespace "$CAMUNDA_NAMESPACE"
+
+                  # Wait for the job to complete
+                  while true; do
+                      STATUS=$(kubectl get job create-setup-user-db --namespace "$CAMUNDA_NAMESPACE" -o jsonpath='{.status.succeeded}')
+
+                      if [[ "$STATUS" == "1" ]]; then
+                          echo "Job completed successfully."
+                          break
+                      fi
+
+                      echo "Waiting for job to complete..."
+                      sleep 5
+                  done
+
+                  echo "[DEBUG] Job log:"
+                  kubectl logs job/create-setup-user-db --namespace "$CAMUNDA_NAMESPACE"
+
+                  kubectl delete job create-setup-user-db --namespace "$CAMUNDA_NAMESPACE"
+
+                  kubectl delete secret setup-db-secret --namespace "$CAMUNDA_NAMESPACE"
+
+            - name: 💪 Execute DB secret creation scripts
+              timeout-minutes: 10
+              run: |
+                  set -euo pipefail
+                  ./azure/kubernetes/${{ matrix.scenario.name }}/procedure/create-external-db-secrets.sh
+
+            - name: 🐘 Deploy Keycloak via Operator (keycloak-operator mode)
+              if: ${{ matrix.scenario.auth_provider == 'keycloak-operator' }}
+              timeout-minutes: 15
+              uses: ./.github/actions/kubernetes-keycloak-operator
+              with:
+                  namespace: ${{ env.CAMUNDA_NAMESPACE }}
+                  keycloak-mode: ${{ matrix.declination.name == 'domain' && 'domain' || 'no-domain' }}
+                  domain-name: ${{ env.CAMUNDA_DOMAIN }}
+
+            - name: 🏁 Install Camunda 8 using the generic/kubernetes helm chart procedure
+              timeout-minutes: 10
+              run: |
+                  set -euo pipefail
+
+                  source generic/kubernetes/single-region/procedure/chart-env.sh
+
+                  AUTH_PROVIDER="${{ matrix.scenario.auth_provider }}"
+
+                  # Identity secrets:
+                  # For 'keycloak-operator', secrets are created by the operator action
+                  # For 'oidc', secrets are created in a separate step
+
+                  # Create WebModeler secrets
+                  if [ "$WEBMODELER_ENABLED" == "true" ]; then
+                    ./azure/kubernetes/${{ matrix.scenario.name }}/procedure/create-webmodeler-secret.sh
+                  fi
+
+                  # Generate tests objects
+                  if [ "$TESTS_ENABLED" == "true" ]; then
+                    # Create the pull secrets described in generic/kubernetes/single-region/tests/helm-values/registry.yml
+                    kubectl create secret docker-registry index-docker-io \
+                        --docker-server=index.docker.io \
+                        --docker-username="${{ steps.secrets.outputs.DOCKERHUB_USER }}" \
+                        --docker-password="${{ steps.secrets.outputs.DOCKERHUB_PASSWORD }}" \
+                        --namespace="$CAMUNDA_NAMESPACE"
+
+                    # TODO: For production deployments, this secret creation should be documented in the procedure
+                    # as registry-harbor.yml is now applied to all deployments (not just tests).
+                    # Users will need to create this secret manually following the documentation:
+                    # https://docs.camunda.io/docs/self-managed/installation-methods/helm/configure/registry-and-images/install-bitnami-enterprise-images/#step-1-create-a-kubernetes-registry-secret
+                    kubectl create secret docker-registry registry-camunda-cloud \
+                        --docker-server=registry.camunda.cloud \
+                        --docker-username="${{ steps.secrets.outputs.MACHINE_USR }}" \
+                        --docker-password="${{ steps.secrets.outputs.MACHINE_PWD }}" \
+                        --namespace="$CAMUNDA_NAMESPACE"
+
+                    # Create identity integration secret for keycloak-operator auth
+                    if [[ "$AUTH_PROVIDER" != "oidc" ]]; then
+                      kubectl create secret generic identity-secret-for-components-integration \
+                          --from-literal=identity-admin-client-id="${{ steps.secrets.outputs.CI_CAMUNDA_USER_TEST_CLIENT_ID }}" \
+                          --from-literal=identity-admin-client-secret="${{ steps.secrets.outputs.CI_CAMUNDA_USER_TEST_CLIENT_SECRET }}" \
+                          --namespace="$CAMUNDA_NAMESPACE"
+                    fi
+                  fi
+
+                  ./generic/kubernetes/single-region/procedure/install-chart.sh
+
+            - name: 👀⏳ Wait for the deployment to be healthy using generic/kubernetes/single-region
+              timeout-minutes: 20
+              run: |
+                  set -euo pipefail
+                  ./generic/kubernetes/single-region/procedure/check-deployment-ready.sh
+
+            - name: 🔄 Restart CoreDNS
+              if: matrix.declination.name == 'domain' && env.CLEANUP_CLUSTERS == 'false'
+              uses: ./.github/actions/kubernetes-restart-coredns
+              timeout-minutes: 10
+              with:
+                  cluster-type: kubernetes
+
+            - name: 📐 Set current Camunda version
+              id: camunda-version
+              run: |
+                  set -euo pipefail
+                  CAMUNDA_VERSION=$(cat .camunda-version)
+                  echo "CAMUNDA_VERSION=$CAMUNDA_VERSION" | tee -a "$GITHUB_OUTPUT"
+
+            - name: 🧪 Run Helm Chart tests
+              if: env.TESTS_ENABLED == 'true'
+              timeout-minutes: 60
+              uses: ./.github/actions/internal-camunda-chart-tests
+              with:
+                  secrets: ${{ toJSON(secrets) }}
+                  camunda-version: ${{ steps.camunda-version.outputs.CAMUNDA_VERSION }}
+                  camunda-domain: ${{ env.CAMUNDA_DOMAIN }}
+                  camunda-domain-grpc: ${{ env.CAMUNDA_DOMAIN_GRPC }}
+                  webmodeler-enabled: ${{ env.WEBMODELER_ENABLED }}
+                  console-enabled: ${{ env.CONSOLE_ENABLED }}
+                  elasticsearch-enabled: 'true'
+                  tests-camunda-helm-chart-repo-ref: ${{ env.TESTS_CAMUNDA_HELM_CHART_REPO_REF }}
+                  tests-camunda-helm-chart-repo-path: ${{ env.TESTS_CAMUNDA_HELM_CHART_REPO_PATH }}
+                  test-namespace: ${{ env.CAMUNDA_NAMESPACE }}
+                  test-cluster-type: ${{ env.TEST_CLUSTER_TYPE }}
+                  test-release-name: ${{ env.CAMUNDA_RELEASE_NAME }}
+                  test-client-id: ${{ steps.secrets.outputs.CI_CAMUNDA_USER_TEST_CLIENT_ID }}
+                  test-client-secret: ${{ steps.secrets.outputs.CI_CAMUNDA_USER_TEST_CLIENT_SECRET }}
+                  keycloak-service-name: ${{ matrix.scenario.auth_provider == 'keycloak-operator' && 'keycloak-service:18080' || '' }}
+
+            - name: 🔬🚨 Get failed certificate info
+              if: failure() && matrix.declination.name == 'domain'
+              run: |
+                  set -euo pipefail
+
+                  kubectl -n "$CAMUNDA_NAMESPACE" get certificates
+                  kubectl -n "$CAMUNDA_NAMESPACE" describe certificates
+
+            - name: 🔬🚨 Get failed Pods info
+              if: failure()
+              uses: ./.github/actions/internal-debug-failed-pods
+              with:
+                  namespace: ${{ env.CAMUNDA_NAMESPACE }}
+                  artifact-suffix: ${{ matrix.scenario.name }}-${{ matrix.declination.name }}
+
+            - name: 🧹 Cleanup Keycloak Operator deployment
+              if: always() && env.CLEANUP_CLUSTERS == 'true' && matrix.scenario.auth_provider == 'keycloak-operator'
+              uses: ./.github/actions/kubernetes-keycloak-operator-cleanup
+              with:
+                  namespace: ${{ env.CAMUNDA_NAMESPACE }}
+
+            - name: 🧹 Cleanup Namespace
+              if: always() && env.CLEANUP_CLUSTERS == 'true'
+              timeout-minutes: 20
+              run: |
+                  set -euo pipefail
+
+                  helm uninstall camunda --namespace "$CAMUNDA_NAMESPACE" --wait
+                  kubectl delete namespace "$CAMUNDA_NAMESPACE" --wait
+
+            - name: 🧹 Cleanup domain specific resources
+              if: always() && matrix.declination.name == 'domain' && env.CLEANUP_CLUSTERS == 'true'
+              timeout-minutes: 10
+              uses: ./.github/actions/kubernetes-ingress-cleanup
+              with:
+                  wait-for-dns-cleanup: 'true'
+                  dns-cleanup-wait-seconds: '45'
+
+    cleanup-clusters:
+        name: Cleanup AKS clusters
+        if: always()
+        needs:
+            - prepare-clusters
+            - clusters-info
+            - integration-tests
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                distro: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).distro }}
+                scenario: ${{ fromJson(needs.clusters-info.outputs.platform-matrix).scenario }}
+
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+              if: env.CLEANUP_CLUSTERS == 'true'
+              with:
+                  fetch-depth: 0
+
+            - name: Install asdf tools with cache
+              if: env.CLEANUP_CLUSTERS == 'true'
+              uses: camunda/infraex-common-config/./.github/actions/asdf-install-tooling@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+
+            - name: Import Secrets
+              id: secrets
+              if: env.CLEANUP_CLUSTERS == 'true'
+              uses: hashicorp/vault-action@4c06c5ccf5c0761b6029f56cfb1dcf5565918a3b # v3
+              with:
+                  url: ${{ secrets.VAULT_ADDR }}
+                  method: approle
+                  roleId: ${{ secrets.VAULT_ROLE_ID }}
+                  secretId: ${{ secrets.VAULT_SECRET_ID }}
+                  exportEnv: false
+                  secrets: |
+                      secret/data/products/infrastructure-experience/ci/common AZURE_CLIENT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_TENANT_ID;
+                      secret/data/products/infrastructure-experience/ci/common AZURE_SUBSCRIPTION_ID;
+
+            - name: Azure Login with OIDC
+              uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+              if: env.CLEANUP_CLUSTERS == 'true'
+              timeout-minutes: 10
+              with:
+                  client-id: ${{ steps.secrets.outputs.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ steps.secrets.outputs.AZURE_TENANT_ID }}
+                  subscription-id: ${{ steps.secrets.outputs.AZURE_SUBSCRIPTION_ID }}
+
+            - name: Configure AWS CLI
+              uses: ./.github/actions/aws-configure-cli
+              if: env.CLEANUP_CLUSTERS == 'true'
+              with:
+                  vault-addr: ${{ secrets.VAULT_ADDR }}
+                  vault-role-id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault-secret-id: ${{ secrets.VAULT_SECRET_ID }}
+                  aws-profile: ${{ env.AWS_PROFILE }}
+                  aws-region: ${{ env.AWS_REGION }}
+
+            - name: Set current target branch
+              if: env.CLEANUP_CLUSTERS == 'true'
+              id: target-branch
+              run: |
+                  set -euo pipefail
+                  TARGET_BRANCH=$(cat .target-branch)
+                  echo "TARGET_BRANCH=$TARGET_BRANCH" | tee -a "$GITHUB_OUTPUT"
+
+            - name: Export S3_BACKEND_BUCKET based on matrix
+              if: env.CLEANUP_CLUSTERS == 'true'
+              id: s3_prefix
+              run: |
+                  set -euo pipefail
+                  echo "S3_BACKEND_BUCKET_PREFIX=azure/kubernetes/${{ matrix.scenario.name }}/" | tee -a "$GITHUB_OUTPUT"
+
+            - name: Delete on-demand AKS Cluster
+              uses: ./.github/actions/azure-kubernetes-aks-single-region-cleanup
+              if: always() && env.CLEANUP_CLUSTERS == 'true'
+              timeout-minutes: 125
+              with:
+                  tf-bucket: ${{ env.S3_BACKEND_BUCKET }}
+                  tf-bucket-region: ${{ env.S3_BUCKET_REGION }}
+                  max-age-hours-cluster: 0
+                  target: ${{ matrix.distro.clusterName }}-${{matrix.scenario.shortName }}-rg
+                  tf-bucket-key-prefix: ${{ steps.s3_prefix.outputs.S3_BACKEND_BUCKET_PREFIX }}${{ steps.target-branch.outputs.TARGET_BRANCH }}/
+
+    report-success:
+        name: Report success
+        runs-on: ubuntu-latest
+        needs:
+            - integration-tests
+            - cleanup-clusters
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+            - name: Prevent other runs for renovate
+              if: ${{ env.IS_RENOVATE_PR == 'true' }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              uses: ./.github/actions/internal-apply-skip-label
+
+    report-failure:
+        name: Report failures
+        if: failure()
+        runs-on: ubuntu-latest
+        needs:
+            - report-success
+        steps:
+            - name: Notify in Slack in case of failure
+              id: slack-notification
+              if: ${{ env.IS_SCHEDULE == 'true' }}
+              uses: camunda/infraex-common-config/.github/actions/report-failure-on-slack@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+              with:
+                  vault_addr: ${{ secrets.VAULT_ADDR }}
+                  vault_role_id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault_secret_id: ${{ secrets.VAULT_SECRET_ID }}

@@ -1,0 +1,33 @@
+---
+name: Internal - Global - Pull Request TODO checker
+
+# This workflow triggers a scan of TODOs in the current pull request.
+# For each TODO that is not marked to be ignored, it posts a comment.
+# It helps ensure that no TODOs are accidentally left behind in merged PRs.
+
+on:
+
+    pull_request:
+        types: [opened, synchronize, reopened]
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    triage:
+        runs-on: ubuntu-latest
+        outputs:
+            should_skip: ${{ steps.skip_check.outputs.should_skip }}
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+            - name: Check labels
+              id: skip_check
+              uses: ./.github/actions/internal-triage-skip
+
+    call-todo-checker:
+        needs:
+            - triage
+        if: needs.triage.outputs.should_skip == 'false'
+        uses: camunda/infraex-common-config/.github/workflows/todo-checker-global.yml@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+        secrets: inherit

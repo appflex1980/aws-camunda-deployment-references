@@ -1,0 +1,57 @@
+---
+name: Internal - Global - Pull Request Backporting
+
+on:
+    pull_request:
+        types: [closed]
+    issue_comment:
+        types: [created]
+
+permissions:
+    contents: write # so it can comment
+    pull-requests: write # so it can create pull requests
+
+jobs:
+    backport:
+        name: Create backport PRs
+        runs-on: ubuntu-latest
+        # Run when pull request is merged or when a comment starting with `/backport`
+        # Exclude the backport action bot (user ID 97796249) to prevent infinite loops
+        if: >
+            (
+              github.event_name == 'pull_request' &&
+              github.event.pull_request.merged
+            ) || (
+              github.event_name == 'issue_comment' &&
+              github.event.issue.pull_request &&
+              github.event.comment.user.id != 97796249 &&
+              startsWith(github.event.comment.body, '/backport')
+            )
+        steps:
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+            - name: Create backport PRs
+              uses: korthout/backport-action@01619ebc9a6e3f6820274221b9956b3e7365000a # v4.1.0
+              with:
+                  add_author_as_assignee: true
+                  copy_assignees: true
+                  experimental: >
+                      {
+                      "conflict_resolution": "draft_commit_conflicts"
+                      }
+                  # matches label 'backport stable/8.7'
+                  label_pattern: ^backport ([^ ]+)$
+                  # see https://github.com/korthout/backport-action#pull_description
+                  pull_description: |-
+                      # Description
+                      Backport of #${pull_number} to `${target_branch}`.
+
+                      relates to ${issue_refs}
+
+            - name: Notify in Slack in case of failure
+              id: slack-notification
+              if: failure() && (github.event_name == 'pull_request' || github.event_name == 'issue_comment')
+              uses: camunda/infraex-common-config/.github/actions/report-failure-on-slack@193a21e1e56c9a65517a822224ac3b4ffa4d6ae4 # 1.5.9
+              with:
+                  vault_addr: ${{ secrets.VAULT_ADDR }}
+                  vault_role_id: ${{ secrets.VAULT_ROLE_ID }}
+                  vault_secret_id: ${{ secrets.VAULT_SECRET_ID }}

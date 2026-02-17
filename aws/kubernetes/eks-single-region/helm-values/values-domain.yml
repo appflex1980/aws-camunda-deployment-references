@@ -1,0 +1,148 @@
+---
+# Base Domain Configuration for Camunda Platform
+#
+# This file contains infrastructure configuration with ingress/domain enabled.
+# Combine with an auth overlay:
+#   - Keycloak Operator: yq ". *+ load(\"generic/kubernetes/operator-based/keycloak/camunda-keycloak-domain-values.yml\")" values-domain.yml > values.yml
+#   - OIDC:              yq ". *+ load(\"values-oidc.yml\")" values-domain.yml > values.yml
+#
+# Required environment variables:
+#   - CAMUNDA_DOMAIN: Your domain name
+#   - OPENSEARCH_HOST: OpenSearch endpoint
+
+global:
+    elasticsearch:
+        enabled: false
+    opensearch:
+        enabled: true
+        aws:
+            enabled: false # we rely on anonymous auth, not irsa, basic auth is not supported on managed OpenSearch
+        auth:
+            username:
+            password:
+        url:
+            protocol: https
+            host: ${OPENSEARCH_HOST}
+            # Amazon OpenSearch Service listens on port 443 opposed to the usual port 9200.
+            port: 443
+
+    security:
+        authentication:
+            method: oidc
+
+    ingress:
+        enabled: true
+        host: ${CAMUNDA_DOMAIN}
+        tls:
+            enabled: true
+            secretName: camunda-c8-tls
+        annotations:
+            kubernetes.io/tls-acme: 'true'
+
+    identity:
+        auth:
+            enabled: true
+            identity:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/managementidentity
+            console:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/console
+            webModeler:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/modeler
+            optimize:
+                redirectUrl: https://${CAMUNDA_DOMAIN}/optimize
+
+identity:
+    enabled: true
+    contextPath: /managementidentity
+
+    fullURL: https://${CAMUNDA_DOMAIN}/managementidentity
+
+    firstUser:
+        enabled: true
+        username: admin
+        email: admin@camunda.local
+        firstName: Admin
+        lastName: User
+        secret:
+            existingSecret: identity-secret-for-components
+            existingSecretKey: identity-first-user-password
+
+    externalDatabase:
+        enabled: true
+        host: ${DB_HOST}
+        port: 5432
+        username: ${DB_IDENTITY_USERNAME}
+        database: ${DB_IDENTITY_NAME}
+        secret:
+            existingSecret: identity-postgres-secret
+            existingSecretKey: password
+
+
+connectors:
+    contextPath: /connectors
+
+optimize:
+    enabled: true
+    contextPath: /optimize
+
+    # OpenSearch prevents migration
+    migration:
+        enabled: false
+
+orchestration:
+    contextPath: /
+
+    data:
+        secondaryStorage:
+            type: opensearch
+
+    security:
+        initialization:
+            defaultRoles:
+                admin:
+                    users:
+                        - admin
+
+    ingress:
+        grpc:
+            enabled: true
+            host: zeebe-${CAMUNDA_DOMAIN}
+            tls:
+                enabled: true
+                secretName: zeebe-c8-tls-grpc
+            annotations:
+                kubernetes.io/tls-acme: 'true'
+
+
+console:
+    enabled: false # by default, console is not enabled
+    contextPath: /console
+
+
+webModeler:
+    enabled: false # by default, webModeler is not enabled
+    contextPath: /modeler
+
+    restapi:
+        externalDatabase:
+            url: jdbc:aws-wrapper:postgresql://${DB_HOST}:5432/${DB_WEBMODELER_NAME}
+            user: ${DB_WEBMODELER_USERNAME}
+            secret:
+                existingSecret: webmodeler-postgres-secret
+                existingSecretKey: password
+        env:
+            - name: SPRING_DATASOURCE_DRIVER_CLASS_NAME
+              value: software.amazon.jdbc.Driver
+        mail:
+            secret:
+                existingSecret: webmodeler-secret
+                existingSecretKey: smtp-password
+            fromAddress: changeme@example.com   # change this required value
+
+webModelerPostgresql:
+    # Will deploy a postgresql datbase for webModeler.
+    # If you enable webModeler, you either need to turn it true or use an external database
+    enabled: false
+
+elasticsearch:
+    enabled: false

@@ -1,0 +1,77 @@
+---
+# OpenShift Base Configuration for Camunda Platform
+#
+# This is the base values file. Auth provider configs are applied via overlays:
+# - Keycloak Operator: merge with generic/kubernetes/operator-based/keycloak/camunda-keycloak-*-values.yml
+# - OIDC: merge with generic/kubernetes/single-region/helm-values/values-oidc.yml + values-oidc-*.yml
+
+global:
+    elasticsearch:
+        enabled: true # use the embedded elasticsearch
+
+    security:
+        authentication:
+            method: oidc
+
+    identity:
+        enabled: true
+        auth:
+            enabled: true
+
+orchestration:
+    contextPath: /
+
+    security:
+        initialization:
+            defaultRoles:
+                admin:
+                    users:
+                        - admin
+
+optimize:
+    enabled: true
+
+connectors:
+    enabled: true
+
+console:
+    enabled: false # by default, console is not enabled
+
+identity:
+    enabled: true
+
+    firstUser:
+        enabled: true
+        username: admin
+        email: admin@camunda.local
+        firstName: Admin
+        lastName: User
+        secret:
+            existingSecret: identity-secret-for-components
+            existingSecretKey: identity-first-user-password
+
+webModeler:
+    enabled: false # by default, webModeler is not enabled
+
+    restapi:
+        mail:
+            secret:
+                existingSecret: webmodeler-secret
+                existingSecretKey: smtp-password
+            fromAddress: changeme@example.com   # change this required value
+
+webModelerPostgresql:
+    # Will deploy a postgresql database for webModeler.
+    # If you enable webModeler, you either need to turn it true or use an external database
+    enabled: false
+    auth:
+        # The chart deployment template references webModelerPostgresql.auth.existingSecret
+        # directly without a default fallback, so we must explicitly provide the secret name.
+        # The secret is created by create-webmodeler-secret.sh
+        existingSecret: webmodeler-postgresql-secret
+        secretKeys:
+            adminPasswordKey: webmodeler-postgresql-admin-password
+            userPasswordKey: webmodeler-postgresql-user-password
+
+elasticsearch:
+    enabled: true # use the embedded elasticsearch
